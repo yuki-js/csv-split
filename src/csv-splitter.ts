@@ -50,100 +50,144 @@ export async function splitCsvFile(
   outputDir: string,
   options?: Partial<SplitOptions>
 ): Promise<void> {
-  // Merge default options with provided options
-  const config: SplitOptions = {
-    ...DEFAULT_OPTIONS,
-    ...options,
-  };
+  return new Promise((resolve, reject) => {
+    try {
+      // Merge default options with provided options
+      const config: SplitOptions = {
+        ...DEFAULT_OPTIONS,
+        ...options,
+      };
 
-  // Get the base name of the file (without extension) to use in output file names
-  const baseName = path.basename(filePath, ".csv");
+      // Get the base name of the file (without extension) to use in output file names
+      const baseName = path.basename(filePath, ".csv");
 
-  // Create a readable stream from the input file
-  const fileStream = fs.createReadStream(filePath);
+      // Create a readable stream from the input file
+      const fileStream = fs.createReadStream(filePath);
 
-  // Create readline interface to read the file line by line
-  const rl = readline.createInterface({
-    input: fileStream,
+      // Create readline interface to read the file line by line
+      const rl = readline.createInterface({
+        input: fileStream,
+      });
+
+      let csvStarted = false;
+      let header: string | null = null;
+      let metadataLineCount = 0;
+      const dataLines: string[] = [];
+      const writeStreams: fs.WriteStream[] = [];
+
+      rl.on("line", (line) => {
+        // Skip metadata headers until we find a CSV line (has commas)
+        if (!csvStarted) {
+          if (!isCsvLine(line)) {
+            metadataLineCount++;
+            return;
+          }
+          // First CSV line found - this is the header
+          csvStarted = true;
+          header = line;
+        } else {
+          // Store data lines (skip the header)
+          dataLines.push(line);
+        }
+      });
+
+      rl.on("close", () => {
+        // Process the data lines and write to files
+        if (dataLines.length === 0) {
+          // No data lines, just resolve
+          console.log(
+            `Split ${path.basename(filePath)} into 0 files with approximately ${
+              config.linesPerFile
+            } lines per file (excluding header).`
+          );
+
+          if (metadataLineCount > 0) {
+            console.log(
+              `Discarded ${metadataLineCount} metadata line(s) from the beginning of the file.`
+            );
+          }
+
+          resolve();
+          return;
+        }
+
+        // Calculate how many files we need
+        const totalFiles = Math.ceil(dataLines.length / config.linesPerFile);
+
+        // Create files with data
+        for (let i = 0; i < totalFiles; i++) {
+          const startIdx = i * config.linesPerFile;
+          const endIdx = Math.min(
+            (i + 1) * config.linesPerFile,
+            dataLines.length
+          );
+          const fileDataLines = dataLines.slice(startIdx, endIdx);
+
+          // Generate output file name
+          const fileName = formatFileName(
+            config.fileNamePattern,
+            baseName,
+            i + 1
+          );
+          const outputFilePath = path.join(outputDir, fileName);
+
+          console.log(`Creating file: ${outputFilePath}`);
+          const writeStream = fs.createWriteStream(outputFilePath);
+          writeStreams.push(writeStream);
+
+          // Write the header to each file
+          if (header !== null) {
+            writeStream.write(`${header}\n`);
+          }
+
+          // Write the data lines
+          for (const dataLine of fileDataLines) {
+            writeStream.write(`${dataLine}\n`);
+          }
+
+          // Close the stream
+          writeStream.end();
+        }
+
+        console.log(
+          `Split ${path.basename(
+            filePath
+          )} into ${totalFiles} files with approximately ${
+            config.linesPerFile
+          } lines per file (excluding header).`
+        );
+
+        if (metadataLineCount > 0) {
+          console.log(
+            `Discarded ${metadataLineCount} metadata line(s) from the beginning of the file.`
+          );
+        }
+
+        // Wait for all write streams to finish
+        let closedStreams = 0;
+        if (writeStreams.length === 0) {
+          resolve();
+          return;
+        }
+
+        writeStreams.forEach((stream) => {
+          stream.on("finish", () => {
+            closedStreams++;
+            if (closedStreams === writeStreams.length) {
+              resolve();
+            }
+          });
+          stream.on("error", (err) => {
+            reject(err);
+          });
+        });
+      });
+
+      rl.on("error", (err) => {
+        reject(err);
+      });
+    } catch (err) {
+      reject(err);
+    }
   });
-
-  let csvStarted = false;
-  let lineCount = 0;
-  let fileCount = 1;
-  let header: string | null = null;
-  let writeStream: fs.WriteStream | null = null;
-  let metadataLineCount = 0;
-
-  for await (const line of rl) {
-    // Skip metadata headers until we find a CSV line (has commas)
-    if (!csvStarted) {
-      if (!isCsvLine(line)) {
-        metadataLineCount++;
-        continue;
-      }
-      // First CSV line found - this is the header
-      csvStarted = true;
-      header = line;
-    }
-
-    // Create a new write stream when needed
-    if (
-      writeStream === null ||
-      (lineCount > 0 && lineCount % config.linesPerFile === 0)
-    ) {
-      if (writeStream !== null) {
-        writeStream.end(); // Close the previous stream
-      }
-
-      // Generate output file name
-      const fileName = formatFileName(
-        config.fileNamePattern,
-        baseName,
-        fileCount
-      );
-      const outputFilePath = path.join(outputDir, fileName);
-
-      console.log(`Creating file: ${outputFilePath}`);
-      writeStream = fs.createWriteStream(outputFilePath);
-
-      // Write the header to each new file
-      if (header !== null) {
-        writeStream.write(`${header}\n`);
-      }
-
-      fileCount++;
-    }
-
-    // Write the current line to the output file
-    // Skip writing the header line again (it's already written when creating the file)
-    if (csvStarted && lineCount === 0) {
-      // This is the header line, already written when creating the file
-      // Do nothing, just increment lineCount later
-    } else {
-      if (writeStream) {
-        writeStream.write(`${line}\n`);
-      }
-    }
-
-    lineCount++;
-  }
-
-  // Close the last write stream if it exists
-  if (writeStream !== null) {
-    writeStream.end();
-  }
-
-  console.log(
-    `Split ${path.basename(filePath)} into ${
-      fileCount - 1
-    } files with approximately ${
-      config.linesPerFile
-    } lines per file (excluding header).`
-  );
-
-  if (metadataLineCount > 0) {
-    console.log(
-      `Discarded ${metadataLineCount} metadata line(s) from the beginning of the file.`
-    );
-  }
 }
